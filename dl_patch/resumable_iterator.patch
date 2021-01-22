@@ -1,0 +1,740 @@
+From 0d8ea317d04e95176ee0bbb8ed98b76c67f1fd8b Mon Sep 17 00:00:00 2001
+From: Jayashree <jaya@cs.utexas.edu>
+Date: Thu, 30 Jul 2020 12:36:19 -0700
+Subject: [PATCH 1/2] Functionality to resume iterator state from a given index
+ and epoch
+
+---
+ dali/operators/reader/file_reader_op.h             |  5 ++
+ dali/operators/reader/loader/file_loader.cc        |  3 +-
+ dali/operators/reader/loader/file_loader.h         | 54 ++++++++++++++++++++--
+ dali/operators/reader/loader/indexed_file_loader.h |  7 +++
+ dali/operators/reader/loader/lmdb.h                |  9 +++-
+ dali/operators/reader/loader/loader.cc             |  6 +++
+ dali/operators/reader/loader/loader.h              | 22 ++++++++-
+ dali/operators/reader/loader/recordio_loader.h     |  7 +++
+ dali/operators/reader/loader/sequence_loader.cc    |  7 +++
+ dali/operators/reader/loader/sequence_loader.h     |  1 +
+ dali/operators/reader/loader/video_loader.cc       |  7 +++
+ dali/operators/reader/loader/video_loader.h        |  1 +
+ dali/operators/reader/reader_op.h                  |  4 ++
+ dali/operators/reader/reader_op_test.cc            | 14 ++++++
+ dali/pipeline/operator/operator.h                  | 12 +++++
+ dali/pipeline/pipeline.cc                          | 10 ++++
+ dali/pipeline/pipeline.h                           |  7 +++
+ dali/python/backend_impl.cc                        |  5 ++
+ dali/python/nvidia/dali/pipeline.py                | 15 ++++++
+ dali/python/nvidia/dali/plugin/pytorch.py          | 23 +++++++--
+ 20 files changed, 207 insertions(+), 12 deletions(-)
+
+diff --git a/dali/operators/reader/file_reader_op.h b/dali/operators/reader/file_reader_op.h
+index 55682b6..8847c9f 100644
+--- a/dali/operators/reader/file_reader_op.h
++++ b/dali/operators/reader/file_reader_op.h
+@@ -33,6 +33,11 @@ class FileReader : public DataReader<CPUBackend, ImageLabelWrapper> {
+                                      shuffle_after_epoch);
+   }
+ 
++  
++  //int GetIndexList(){
++  //  return 0;
++  //}
++
+   void RunImpl(SampleWorkspace &ws) override {
+     const int idx = ws.data_idx();
+     //std::cout << __FILE__ << " : GETTING SAMPLE IDX : " << idx << std::endl;
+diff --git a/dali/operators/reader/loader/file_loader.cc b/dali/operators/reader/loader/file_loader.cc
+index 814aa2a..bbf2187 100644
+--- a/dali/operators/reader/loader/file_loader.cc
++++ b/dali/operators/reader/loader/file_loader.cc
+@@ -132,7 +132,8 @@ void FileLoader::ReadSample(ImageLabelWrapper &image_label) {
+   auto image_pair = image_label_pairs_[current_index_++];
+   //auto image_pair = std::make_pair(std::get<0>(image_tuple), std::get<1>(image_tuple));
+   int cur_idx = current_index_ - 1;
+-  //outfile << "Reading Current index = " << cur_idx << ", img = " << image_pair.first << std::endl;
++  if (debug_)
++    outfile_index  << cur_idx << ", " << image_pair.first << std::endl;
+ 
+   // handle wrap-around
+   MoveToNextShard(current_index_);
+diff --git a/dali/operators/reader/loader/file_loader.h b/dali/operators/reader/loader/file_loader.h
+index 61b54e8..6a32f6a 100755
+--- a/dali/operators/reader/loader/file_loader.h
++++ b/dali/operators/reader/loader/file_loader.h
+@@ -124,6 +124,20 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+         DALI_ENFORCE(
+           !shuffle_after_epoch_ || !shuffle_,
+           "shuffle_after_epoch and random_shuffle cannot be both true");
++      if (resume_index_ > 0){
++        DALI_ENFORCE(shuffle_after_epoch_, 
++          "Shuffle must be set to resume loader from a fixed index");
++      }
++
++      if (!resume_index_ && !resume_epoch_){
++        must_resume_chk_ = false;
++      }
++      else{
++        DALI_ENFORCE(resume_epoch_ >= 0 , 
++          "Epoch must be set to resume loader from a fixed index");
++        must_resume_chk_ = true;
++      }
++
+       /*
+        * Imply `stick_to_shard` from  `shuffle_after_epoch`
+        */
+@@ -137,6 +151,10 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+ 
+   void PrepareEmpty(ImageLabelWrapper &tensor) override;
+   void ReadSample(ImageLabelWrapper &tensor) override;
++
++  std::vector<std::pair<string, int>> GetIndexList() override {
++    return image_label_pairs_;
++  }
+   
+   ~FileLoader() {
+      if (dist_mint){
+@@ -199,10 +217,8 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+ 
+     //if (current_epoch_ == 0)
+     //  image_label_pairs_orig_ = image_label_pairs_;
+-
++    image_label_pairs_orig_ = image_label_pairs_;
+     Reset(true);
+-    //for (int i = 0; i < static_cast<int>(image_label_pairs_.size()); i++)
+-    //    outfile << i << " : " << std::get<0>(image_label_pairs_[i]) << ", " << std::get<1>(image_label_pairs_[i]) << std::endl;
+   }
+ 
+   /* This function is called before the use of FileLoader iter
+@@ -215,18 +231,31 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+       current_index_ = start_index(shard_id_, num_shards_, Size());
+       index_start_ = current_index_;
+       index_end_ = current_index_ + Size()/num_shards_;
+-      //outfile << __FILE__ << " Reset : wrap to shard" << endl;
+     } else {
+       current_index_ = 0;
+       index_start_ = current_index_;
+       index_end_ = current_index_ + Size()/num_shards_;
+     }
++
++      // Check if the index is within the shard
++      if (must_resume_chk_){
++        current_index_ = current_index_ + resume_index_;
++        DALI_ENFORCE(current_index_ <= index_end_, "Resume index cannot be larger than shard size");
++        current_epoch_ = resume_epoch_;
++        if (debug_)
++            outfile << "Resuming at index " << current_index_ << " and epoch " << current_epoch_ << std::endl;
++      }
++
+       outfile << "Current Epoch : " << current_epoch_ << endl;
+       outfile << "Cache size : " << cache_size_  << "\nCached : " << caching_done_ << endl;
+       outfile << "Current index : " << current_index_ << "\nindex_start : " << index_start_ << "\nindex_end : " << index_end_ << endl;
+ 
+     if (shuffle_after_epoch_) {
++      if (debug_)
++        outfile << "Shuffling with seed = " << shuffle_seed_ << " + " << current_epoch_ << std::endl;
++      
+       std::mt19937 g(kDaliDataloaderSeed + shuffle_seed_ + current_epoch_);
++      image_label_pairs_ = image_label_pairs_orig_;
+       std::shuffle(image_label_pairs_.begin(), image_label_pairs_.end(), g);
+     }
+     // If the epoch count is 1 here, it means we have completed
+@@ -335,6 +364,16 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+        
+ 
+     current_epoch_++;
++    /*
++    if (debug_){
++      outfile << "Epoch = " << current_epoch_ << std::endl;
++      for (int i = 0; i < static_cast<int>(image_label_pairs_.size()); i++)
++        outfile << i << " : " << image_label_pairs_[i].first << " : " << image_label_pairs_[i].second << std::endl;
++      outfile << "Current index = " << current_index_ << std::endl;
++      outfile << "Start index = " << index_start_ << std::endl;
++    }*/
++    // We want subsequent epochs to explore full dataset
++    must_resume_chk_ = false;
+ 
+     if (resume_)
+         caching_done_ = true;
+@@ -342,15 +381,19 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+   }
+ 
+   using Loader<CPUBackend, ImageLabelWrapper>::shard_id_;
++  using Loader<CPUBackend, ImageLabelWrapper>::resume_index_;
++  using Loader<CPUBackend, ImageLabelWrapper>::resume_epoch_;
+   using Loader<CPUBackend, ImageLabelWrapper>::shuffle_seed_;
+   using Loader<CPUBackend, ImageLabelWrapper>::cache_size_orig_;
+   using Loader<CPUBackend, ImageLabelWrapper>::num_shards_;
+   using Loader<CPUBackend, ImageLabelWrapper>::num_nodes_;
+   using Loader<CPUBackend, ImageLabelWrapper>::node_id_;
+   using Loader<CPUBackend, ImageLabelWrapper>::resume_;
++  using Loader<CPUBackend, ImageLabelWrapper>::debug_;
+   //using Loader<CPUBackend, ImageLabelWrapper>::node_port_list_;
+   using Loader<CPUBackend, ImageLabelWrapper>::seed_;
+   using Loader<CPUBackend, ImageLabelWrapper>::outfile;
++  using Loader<CPUBackend, ImageLabelWrapper>::outfile_index;
+   using Loader<CPUBackend, ImageLabelWrapper>::num_shards_per_node_;
+ 
+   string file_root_, file_list_, node_ip_;
+@@ -362,11 +405,12 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+   int cache_size_ = 0;
+   //A map of file paths, label and a bool that indicates whether cached
+   vector<std::pair<string, int>> image_label_pairs_;
+-//  vector<std::pair<string, int>> image_label_pairs_orig_;
++  vector<std::pair<string, int>> image_label_pairs_orig_;
+   bool shuffle_after_epoch_;
+   Index current_index_;
+   int current_epoch_;
+   bool caching_done_;
++  bool must_resume_chk_;
+   int index_start_;
+   int index_end_;
+   bool dist_mint = false;
+diff --git a/dali/operators/reader/loader/indexed_file_loader.h b/dali/operators/reader/loader/indexed_file_loader.h
+index 4e71c72..c3d00bd 100755
+--- a/dali/operators/reader/loader/indexed_file_loader.h
++++ b/dali/operators/reader/loader/indexed_file_loader.h
+@@ -36,6 +36,13 @@ class IndexedFileLoader : public Loader<CPUBackend, Tensor<CPUBackend>> {
+       current_index_(0), current_file_index_(0), current_file_(nullptr) {
+     }
+ 
++  std::vector<std::pair<string, int>> GetIndexList() override {
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;
++  }
++
+   void ReadSample(Tensor<CPUBackend>& tensor) override {
+     MoveToNextShard(current_index_);
+ 
+diff --git a/dali/operators/reader/loader/lmdb.h b/dali/operators/reader/loader/lmdb.h
+index 5f07645..1d063ab 100644
+--- a/dali/operators/reader/loader/lmdb.h
++++ b/dali/operators/reader/loader/lmdb.h
+@@ -163,7 +163,14 @@ class LMDBLoader : public Loader<CPUBackend, Tensor<CPUBackend>> {
+     file_index = find_lower_bound(offsets_, index);
+     local_index = index - offsets_[file_index];
+   }
+-
++ 
++  std::vector<std::pair<string, int>> GetIndexList() override {
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;
++  }
++ 
+   void ReadSample(Tensor<CPUBackend>& tensor) override {
+     // assume cursor is valid, read next, loop to start if necessary
+ 
+diff --git a/dali/operators/reader/loader/loader.cc b/dali/operators/reader/loader/loader.cc
+index c9c396f..a651bb8 100644
+--- a/dali/operators/reader/loader/loader.cc
++++ b/dali/operators/reader/loader/loader.cc
+@@ -32,8 +32,14 @@ this parameter is ignored.)code", 1024)
+       R"code(ID of the node in multi GPU training).)code", 0)
+   .AddOptionalArg("resume",
+       R"code(Resume with old cache.)code", false)
++  .AddOptionalArg("debug",
++      R"code(Print debug stmts)code", false)
+   .AddOptionalArg("shard_id",
+       R"code(Id of the part to read.)code", 0)
++  .AddOptionalArg("resume_index",
++      R"code(Index to resume loader from.)code", 0)
++  .AddOptionalArg("resume_epoch",
++      R"code(Epoch to resume loader from.)code", 0)
+   .AddOptionalArg("cache_size",
+       R"code(Number of items to cache for this loader.)code", 0)
+   .AddOptionalArg("shuffle_seed",
+diff --git a/dali/operators/reader/loader/loader.h b/dali/operators/reader/loader/loader.h
+index 12b3e01..af16458 100644
+--- a/dali/operators/reader/loader/loader.h
++++ b/dali/operators/reader/loader/loader.h
+@@ -78,10 +78,13 @@ class Loader {
+       cache_size_orig_(options.GetArgument<int>("cache_size")),
+       shuffle_seed_(options.GetArgument<int>("shuffle_seed")),
+       shard_id_(options.GetArgument<int>("shard_id")),
++      resume_index_(options.GetArgument<int>("resume_index")),
++      resume_epoch_(options.GetArgument<int>("resume_epoch")),
+       num_shards_(options.GetArgument<int>("num_shards")),
+       num_nodes_(options.GetArgument<int>("num_nodes")),
+       node_id_(options.GetArgument<int>("node_id")),
+       resume_(options.GetArgument<bool>("resume")),
++      debug_(options.GetArgument<bool>("debug")),
+       //node_port_list_(options.GetRepeatedArgument<int>("node_port_list")),
+       copy_read_data_(false),
+       read_ahead_(options.GetArgument<bool>("read_ahead")),
+@@ -94,11 +97,14 @@ class Loader {
+       returned_sample_counter_(0),
+       pad_last_batch_(options.GetArgument<bool>("pad_last_batch")) {
+     DALI_ENFORCE(initial_empty_size_ > 0, "Batch size needs to be greater than 0");
++    DALI_ENFORCE(resume_index_ >= 0, "Index to resume loading must be greater than/ equal to 0");
+     DALI_ENFORCE(num_shards_ > shard_id_, "num_shards needs to be greater than shard_id");
+     // initialize a random distribution -- this will be
+     // used to pick from our sample buffer
+     string ofname = to_string(shard_id_) + "-" + to_string(cache_size_orig_) + ".log";
++    string ofname_index = to_string(shard_id_) + "-" + to_string(cache_size_orig_) + "-index.log";
+     outfile.open(ofname);
++    outfile_index.open(ofname_index);
+     std::seed_seq seq({seed_});
+     e_ = std::default_random_engine(seq);
+     virtual_shard_id_ = shard_id_;
+@@ -106,6 +112,7 @@ class Loader {
+ 
+   virtual ~Loader() {
+     outfile.close();
++    outfile_index.close();
+     sample_buffer_.clear();
+     empty_tensors_.clear();
+   }
+@@ -200,7 +207,7 @@ class Loader {
+ 
+     int offset = shuffle_ ? dis(e_) : 0;
+     Index idx = (shards_.front().start + offset) % sample_buffer_.size();
+-    //outfile << __FILE__ << " : IDX from buffer : " << idx << std::endl;
++    //outfile << ": IDX from buffer : " << idx << " shard_front = " << shards_.front().start  << " size = " << sample_buffer_.size() << std::endl;
+     LoadTargetSharedPtr sample_ptr(sample_buffer_[idx].release(),
+       [this](LoadTarget* sample) {
+         LoadTargetUniquePtr recycle_ptr(sample);
+@@ -243,6 +250,7 @@ class Loader {
+   // used to populate the sample buffer for "shuffled"
+   // reads.
+   virtual void ReadSample(LoadTarget& tensor) = 0;
++  virtual std::vector<std::pair<string, int>> GetIndexList() = 0;
+ 
+   void PrepareMetadata() {
+     std::lock_guard<std::mutex> l(prepare_metadata_mutex_);
+@@ -272,6 +280,14 @@ class Loader {
+     }
+   }
+ 
++  /*std::vector<std::pair<string, int>> GetIndexList(){
++    std::cout << "From loader" << std::endl;
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;
++  }*/
++
+  protected:
+   virtual Index SizeImpl() = 0;
+ 
+@@ -345,6 +361,7 @@ class Loader {
+ 
+   //output file
+   std::ofstream outfile;
++  std::ofstream outfile_index;
+   string outfile_name;
+ 
+   // rng
+@@ -362,10 +379,13 @@ class Loader {
+ 
+   // sharding
+   const int shard_id_;
++  const int resume_index_;
++  const int resume_epoch_;
+   const int num_shards_;
+   const int num_nodes_;
+   const int node_id_;
+   const bool resume_;
++  const bool debug_;
+   //vector<int> node_port_list_;
+   std::mutex net_mutex_;
+ 
+diff --git a/dali/operators/reader/loader/recordio_loader.h b/dali/operators/reader/loader/recordio_loader.h
+index 21ef640..91c5b30 100644
+--- a/dali/operators/reader/loader/recordio_loader.h
++++ b/dali/operators/reader/loader/recordio_loader.h
+@@ -74,6 +74,13 @@ class RecordIOLoader : public IndexedFileLoader {
+     index_file.close();
+   }
+ 
++  std::vector<std::pair<string, int>> GetIndexList() override {
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;
++  }
++
+   void ReadSample(Tensor<CPUBackend>& tensor) override {
+     // if we moved to next shard wrap up
+     MoveToNextShard(current_index_);
+diff --git a/dali/operators/reader/loader/sequence_loader.cc b/dali/operators/reader/loader/sequence_loader.cc
+index 9100a6f..df92c70 100644
+--- a/dali/operators/reader/loader/sequence_loader.cc
++++ b/dali/operators/reader/loader/sequence_loader.cc
+@@ -99,6 +99,13 @@ void SequenceLoader::PrepareEmpty(TensorSequence &sequence) {
+   }
+ }
+ 
++std::vector<std::pair<string, int>> SequenceLoader::GetIndexList() {
++  std::vector<std::pair<string, int>> vect;
++  string none("NONE");
++  vect.push_back(std::make_pair(none, -1));
++  return vect;
++}
++
+ void SequenceLoader::ReadSample(TensorSequence &sequence) {
+   // TODO(klecki) this is written as a prototype for video handling
+   const auto &sequence_paths = sequences_[current_sequence_];
+diff --git a/dali/operators/reader/loader/sequence_loader.h b/dali/operators/reader/loader/sequence_loader.h
+index b154ec3..6cfd0f7 100644
+--- a/dali/operators/reader/loader/sequence_loader.h
++++ b/dali/operators/reader/loader/sequence_loader.h
+@@ -97,6 +97,7 @@ class SequenceLoader : public Loader<CPUBackend, TensorSequence> {
+ 
+   void PrepareEmpty(TensorSequence &tensor) override;
+   void ReadSample(TensorSequence &tensor) override;
++  std::vector<std::pair<string, int>> GetIndexList() override;
+ 
+  protected:
+   Index SizeImpl() override;
+diff --git a/dali/operators/reader/loader/video_loader.cc b/dali/operators/reader/loader/video_loader.cc
+index adca702..5c947be 100644
+--- a/dali/operators/reader/loader/video_loader.cc
++++ b/dali/operators/reader/loader/video_loader.cc
+@@ -701,6 +701,13 @@ void VideoLoader::PrepareEmpty(SequenceWrapper &tensor) {
+   tensor.sequence.Resize({tensor_init_bytes_});
+ }
+ 
++std::vector<std::pair<string, int>> VideoLoader::GetIndexList(){
++  std::vector<std::pair<string, int>> vect;
++  string none("NONE");
++  vect.push_back(std::make_pair(none, -1));
++  return vect;
++}
++
+ void VideoLoader::ReadSample(SequenceWrapper& tensor) {
+     // TODO(spanev) remove the async between the 2 following methods?
+     auto& seq_meta = frame_starts_[current_frame_idx_];
+diff --git a/dali/operators/reader/loader/video_loader.h b/dali/operators/reader/loader/video_loader.h
+index aab53db..4abe54e 100644
+--- a/dali/operators/reader/loader/video_loader.h
++++ b/dali/operators/reader/loader/video_loader.h
+@@ -199,6 +199,7 @@ class VideoLoader : public Loader<GPUBackend, SequenceWrapper> {
+ 
+   void PrepareEmpty(SequenceWrapper &tensor) override;
+   void ReadSample(SequenceWrapper &tensor) override;
++  std::vector<std::pair<string, int>> GetIndexList() override;
+ 
+   VideoFile& get_or_open_file(const std::string &filename);
+   void seek(VideoFile& file, int frame);
+diff --git a/dali/operators/reader/reader_op.h b/dali/operators/reader/reader_op.h
+index ef6d427..1d04699 100644
+--- a/dali/operators/reader/reader_op.h
++++ b/dali/operators/reader/reader_op.h
+@@ -166,6 +166,10 @@ class DataReader : public Operator<Backend> {
+     return loader_->SizePadded();
+   }
+ 
++  std::vector<std::pair<string, int>> index_list() const override {
++    return loader_->GetIndexList();
++  }
++
+   LoadTarget& GetSample(int sample_idx) {
+     return *prefetched_batch_queue_[curr_batch_consumer_][sample_idx];
+   }
+diff --git a/dali/operators/reader/reader_op_test.cc b/dali/operators/reader/reader_op_test.cc
+index 8f773ed..3045a3c 100644
+--- a/dali/operators/reader/reader_op_test.cc
++++ b/dali/operators/reader/reader_op_test.cc
+@@ -42,6 +42,14 @@ class DummyLoader : public Loader<CPUBackend, Tensor<CPUBackend>> {
+     t.set_type(TypeInfo::Create<uint8_t>());
+   }
+ 
++  std::vector<std::pair<string, int>> GetIndexList() override {
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;  
++  }
++
++
+   void PrepareMetadataImpl() override {
+     if (dummyfile_ != "") {
+       std::ifstream f(dummyfile_);
+@@ -253,6 +261,12 @@ class TestLoader : public Loader<CPUBackend, Tensor<CPUBackend>> {
+     Loader<CPUBackend, Tensor<CPUBackend>>(spec), current_index_(0) {}
+ 
+   void ReadSample(Tensor<CPUBackend> &t) override {}
++  std::vector<std::pair<string, int>> GetIndexList() override {
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;  
++  }
+ 
+   Index SizeImpl() override {
+     return internal_size_;
+diff --git a/dali/pipeline/operator/operator.h b/dali/pipeline/operator/operator.h
+index e0978a8..4220152 100644
+--- a/dali/pipeline/operator/operator.h
++++ b/dali/pipeline/operator/operator.h
+@@ -154,6 +154,18 @@ class DLL_PUBLIC OperatorBase {
+     return -1;
+   }
+ 
++  /**
++   * @brief For reader Ops, returns the shuffle order of the dataset
++   * For all other Ops, returns -1
++   */
++  DLL_PUBLIC virtual std::vector<std::pair<string, int>> index_list() const {
++    std::vector<std::pair<string, int>> vect;
++    string none("NONE");
++    vect.push_back(std::make_pair(none, -1));
++    return vect;
++  }
++
++
+   template <typename Workspace>
+   TensorLayout InputLayout(const Workspace &ws, int index) const {
+     return GetInputLayout(ws, spec_.GetSchema(), index);
+diff --git a/dali/pipeline/pipeline.cc b/dali/pipeline/pipeline.cc
+index a85e039..61c0141 100644
+--- a/dali/pipeline/pipeline.cc
++++ b/dali/pipeline/pipeline.cc
+@@ -743,6 +743,7 @@ OpNode * Pipeline::GetOperatorNode(const std::string& name) {
+ }
+ 
+ std::map<std::string, Index> Pipeline::EpochSize() {
++  std::cout << "CALLED FROM PIPELINE EPOCHSIZE" << std::endl;
+   std::map<std::string, Index> ret;
+   for (Index i = 0; i < graph_.NumOp(OpType::CPU); ++i) {
+     const OpNode &current = graph_.Node(OpType::CPU, i);
+@@ -761,6 +762,15 @@ std::map<std::string, Index> Pipeline::EpochSize() {
+   return ret;
+ }
+ 
++
++std::vector<std::pair<string, int>> Pipeline::IndexList(const std::string& name) {
++  std::cout << "CALLED FROM PIPELINE INDEXLIST for " << name << std::endl;
++  const OpNode &current = graph_.Node(name);
++  std::vector<std::pair<string, int>> ret;
++  ret = current.op->index_list();
++  return ret;
++}
++
+ void Pipeline::SaveGraphToDotFile(const std::string &filename, bool show_tensors, bool show_ids,
+                                   bool use_colors) {
+   graph_.SaveToDotFile(filename, show_tensors, show_ids, use_colors);
+diff --git a/dali/pipeline/pipeline.h b/dali/pipeline/pipeline.h
+index 78fa9ed..f0467f3 100644
+--- a/dali/pipeline/pipeline.h
++++ b/dali/pipeline/pipeline.h
+@@ -354,6 +354,13 @@ class DLL_PUBLIC Pipeline {
+    */
+   DLL_PUBLIC std::map<std::string, Index> EpochSize();
+ 
++  
++  /**
++   * @brief Returns the vector of (file name, label)
++   * in the shuffle order currently processed
++   */
++  DLL_PUBLIC std::vector<std::pair<string, int>> IndexList(const std::string& name);
++
+   /**
+    * @brief Returns the number of threads used by the pipeline.
+    */
+diff --git a/dali/python/backend_impl.cc b/dali/python/backend_impl.cc
+index 9e7f01c..eb572b6 100644
+--- a/dali/python/backend_impl.cc
++++ b/dali/python/backend_impl.cc
+@@ -899,6 +899,11 @@ PYBIND11_MODULE(backend_impl, m) {
+           DALI_ENFORCE(sizes.find(op_name) != sizes.end(),
+               "Operator " + op_name + " does not expose valid epoch size.");
+           return sizes[op_name];
++        })
++    .def("index_list",
++        [](Pipeline* p, const std::string& op_name) {
++          std::vector<std::pair<std::string, int>> list = p->IndexList(op_name);
++          return list;
+         });
+ 
+ #define DALI_OPSPEC_ADDARG(T) \
+diff --git a/dali/python/nvidia/dali/pipeline.py b/dali/python/nvidia/dali/pipeline.py
+index 428c7ae..317c030 100644
+--- a/dali/python/nvidia/dali/pipeline.py
++++ b/dali/python/nvidia/dali/pipeline.py
+@@ -171,6 +171,21 @@ class Pipeline(object):
+             return self._pipe.epoch_size(name)
+         return self._pipe.epoch_size()
+ 
++    def index_list(self, name = None):
++        """Current order of data items processed by the pipeline
++           Returns a list of <index, file name> pairs in the same
++             order as the FileReader is processing it.
++           If name is not specified, returns -1
++        """
++        if not self._built:
++            raise RuntimeError("Pipeline must be built first.")
++        if name is not None:
++            return self._pipe.index_list(name)
++        return -1
++
++
++
++
+     @staticmethod
+     def current(raise_error_if_none = True):
+         pipeline = getattr(pipeline_tls, 'current_pipeline', None)
+diff --git a/dali/python/nvidia/dali/plugin/pytorch.py b/dali/python/nvidia/dali/plugin/pytorch.py
+index c690417..18fb092 100644
+--- a/dali/python/nvidia/dali/plugin/pytorch.py
++++ b/dali/python/nvidia/dali/plugin/pytorch.py
+@@ -124,7 +124,8 @@ class DALIGenericIterator(object):
+                  auto_reset=False,
+                  fill_last_batch=True,
+                  dynamic_shape=False,
+-                 last_batch_padded = False):
++                 last_batch_padded = False,
++                 resume_size=-1):
+         if not isinstance(pipelines, list):
+             pipelines = [pipelines]
+         self._num_gpus = len(pipelines)
+@@ -135,6 +136,10 @@ class DALIGenericIterator(object):
+         self._dynamic_shape = dynamic_shape
+         self._fill_last_batch = fill_last_batch
+         self._last_batch_padded = last_batch_padded
++        self._resume_size = resume_size
++        if self._resume_size >= 0:
++            self._orig_size = self._size
++            self._size = self._resume_size
+         #print("PIPELINE - Num gpu={}, size={}, batch={}".format(self._num_gpus, self._size, self.batch_size))
+         assert self._size != 0, "Size cannot be 0"
+         assert self._size > 0 or (self._size < 0 and len(pipelines) == 1), "Negative size is supported only for a single pipeline"
+@@ -170,6 +175,7 @@ class DALIGenericIterator(object):
+         if self._counter >= self._size and self._size > 0:
+             if self._auto_reset:
+                 self.reset()
++            #print("Raising STOP ITER at {}".format(self._counter))
+             raise StopIteration
+         # Gather outputs
+         outputs = []
+@@ -270,17 +276,24 @@ class DALIGenericIterator(object):
+         and will ignore such request.
+         """
+         if self._counter >= self._size or self._size < 0:
++            #print("RESET DONE: counter={}, size={}".format(self._counter, self._size))
+             if self._fill_last_batch and not self._last_batch_padded:
+                 self._counter = self._counter % self._size
+             else:
+                 self._counter = 0
++            if self._resume_size >= 0: 
++                if self._size != self._orig_size:
++                    print("Size reset from {} to {}".format(self._size, self._orig_size))
++                    self._size = self._orig_size
+             for p in self._pipes:
+                 p.reset()
++                #print("AFTER RESET DONE: counter={}, size={}".format(self._counter, self._size))
+                 if p.empty():
+                     with p._check_api_type_scope(types.PipelineAPIType.ITERATOR):
+                         p.schedule_run()
+         else:
+-            logging.warning("DALI iterator does not support resetting while epoch is not finished. Ignoring...")
++            print("CANT RESET: counter={}, size={}".format(self._counter, self._size))
++            logging.warning("DALI iterator does not support resetting while epoch is not finished. Ignoring... ")
+ 
+ class DALIClassificationIterator(DALIGenericIterator):
+     """
+@@ -354,12 +367,14 @@ class DALIClassificationIterator(DALIGenericIterator):
+                  auto_reset=False,
+                  fill_last_batch=True,
+                  dynamic_shape=False,
+-                 last_batch_padded=False):
++                 last_batch_padded=False,
++                 resume_size=-1):
+         super(DALIClassificationIterator, self).__init__(pipelines, ["data", "label"],
+                                                          size, auto_reset = auto_reset,
+                                                          fill_last_batch = fill_last_batch,
+                                                          dynamic_shape = dynamic_shape,
+-                                                         last_batch_padded = last_batch_padded)
++                                                         last_batch_padded = last_batch_padded,
++                                                         resume_size = resume_size)
+ 
+ 
+ class TorchPythonFunction(ops.PythonFunctionBase):
+-- 
+2.7.4
+
+
+From a40d47f3cb862c13fa3d727841cdd619bd23cc7c Mon Sep 17 00:00:00 2001
+From: Jayashree <jaya@cs.utexas.edu>
+Date: Fri, 22 Jan 2021 05:34:28 -0800
+Subject: [PATCH 2/2] Add deterministic shuffle
+
+---
+ dali/operators/reader/loader/file_loader.h | 9 +++++++--
+ dali/operators/reader/loader/loader.cc     | 2 ++
+ dali/operators/reader/loader/loader.h      | 2 ++
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/dali/operators/reader/loader/file_loader.h b/dali/operators/reader/loader/file_loader.h
+index 6a32f6a..24b5f8f 100755
+--- a/dali/operators/reader/loader/file_loader.h
++++ b/dali/operators/reader/loader/file_loader.h
+@@ -217,7 +217,9 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+ 
+     //if (current_epoch_ == 0)
+     //  image_label_pairs_orig_ = image_label_pairs_;
+-    image_label_pairs_orig_ = image_label_pairs_;
++    if (synergy_det_)
++        image_label_pairs_orig_ = image_label_pairs_;
++
+     Reset(true);
+   }
+ 
+@@ -255,7 +257,9 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+         outfile << "Shuffling with seed = " << shuffle_seed_ << " + " << current_epoch_ << std::endl;
+       
+       std::mt19937 g(kDaliDataloaderSeed + shuffle_seed_ + current_epoch_);
+-      image_label_pairs_ = image_label_pairs_orig_;
++      if (synergy_det_)
++          image_label_pairs_ = image_label_pairs_orig_;
++
+       std::shuffle(image_label_pairs_.begin(), image_label_pairs_.end(), g);
+     }
+     // If the epoch count is 1 here, it means we have completed
+@@ -390,6 +394,7 @@ class FileLoader : public Loader<CPUBackend, ImageLabelWrapper> {
+   using Loader<CPUBackend, ImageLabelWrapper>::node_id_;
+   using Loader<CPUBackend, ImageLabelWrapper>::resume_;
+   using Loader<CPUBackend, ImageLabelWrapper>::debug_;
++  using Loader<CPUBackend, ImageLabelWrapper>::synergy_det_;
+   //using Loader<CPUBackend, ImageLabelWrapper>::node_port_list_;
+   using Loader<CPUBackend, ImageLabelWrapper>::seed_;
+   using Loader<CPUBackend, ImageLabelWrapper>::outfile;
+diff --git a/dali/operators/reader/loader/loader.cc b/dali/operators/reader/loader/loader.cc
+index a651bb8..dc46a69 100644
+--- a/dali/operators/reader/loader/loader.cc
++++ b/dali/operators/reader/loader/loader.cc
+@@ -34,6 +34,8 @@ this parameter is ignored.)code", 1024)
+       R"code(Resume with old cache.)code", false)
+   .AddOptionalArg("debug",
+       R"code(Print debug stmts)code", false)
++  .AddOptionalArg("synergy_det",
++      R"code(Deterministic shuffle orders)code", false)
+   .AddOptionalArg("shard_id",
+       R"code(Id of the part to read.)code", 0)
+   .AddOptionalArg("resume_index",
+diff --git a/dali/operators/reader/loader/loader.h b/dali/operators/reader/loader/loader.h
+index af16458..d30f184 100644
+--- a/dali/operators/reader/loader/loader.h
++++ b/dali/operators/reader/loader/loader.h
+@@ -85,6 +85,7 @@ class Loader {
+       node_id_(options.GetArgument<int>("node_id")),
+       resume_(options.GetArgument<bool>("resume")),
+       debug_(options.GetArgument<bool>("debug")),
++      synergy_det_(options.GetArgument<bool>("synergy_det")),
+       //node_port_list_(options.GetRepeatedArgument<int>("node_port_list")),
+       copy_read_data_(false),
+       read_ahead_(options.GetArgument<bool>("read_ahead")),
+@@ -386,6 +387,7 @@ class Loader {
+   const int node_id_;
+   const bool resume_;
+   const bool debug_;
++  const bool synergy_det_;
+   //vector<int> node_port_list_;
+   std::mutex net_mutex_;
+ 
+-- 
+2.7.4
+
