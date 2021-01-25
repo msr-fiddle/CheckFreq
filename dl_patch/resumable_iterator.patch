@@ -677,7 +677,7 @@ index 6a32f6a..24b5f8f 100755
      //if (current_epoch_ == 0)
      //  image_label_pairs_orig_ = image_label_pairs_;
 -    image_label_pairs_orig_ = image_label_pairs_;
-+    if (synergy_det_)
++    if (cf_det_)
 +        image_label_pairs_orig_ = image_label_pairs_;
 +
      Reset(true);
@@ -688,7 +688,7 @@ index 6a32f6a..24b5f8f 100755
        
        std::mt19937 g(kDaliDataloaderSeed + shuffle_seed_ + current_epoch_);
 -      image_label_pairs_ = image_label_pairs_orig_;
-+      if (synergy_det_)
++      if (cf_det_)
 +          image_label_pairs_ = image_label_pairs_orig_;
 +
        std::shuffle(image_label_pairs_.begin(), image_label_pairs_.end(), g);
@@ -698,7 +698,7 @@ index 6a32f6a..24b5f8f 100755
    using Loader<CPUBackend, ImageLabelWrapper>::node_id_;
    using Loader<CPUBackend, ImageLabelWrapper>::resume_;
    using Loader<CPUBackend, ImageLabelWrapper>::debug_;
-+  using Loader<CPUBackend, ImageLabelWrapper>::synergy_det_;
++  using Loader<CPUBackend, ImageLabelWrapper>::cf_det_;
    //using Loader<CPUBackend, ImageLabelWrapper>::node_port_list_;
    using Loader<CPUBackend, ImageLabelWrapper>::seed_;
    using Loader<CPUBackend, ImageLabelWrapper>::outfile;
@@ -710,7 +710,7 @@ index a651bb8..dc46a69 100644
        R"code(Resume with old cache.)code", false)
    .AddOptionalArg("debug",
        R"code(Print debug stmts)code", false)
-+  .AddOptionalArg("synergy_det",
++  .AddOptionalArg("cf_det",
 +      R"code(Deterministic shuffle orders)code", false)
    .AddOptionalArg("shard_id",
        R"code(Id of the part to read.)code", 0)
@@ -723,7 +723,7 @@ index af16458..d30f184 100644
        node_id_(options.GetArgument<int>("node_id")),
        resume_(options.GetArgument<bool>("resume")),
        debug_(options.GetArgument<bool>("debug")),
-+      synergy_det_(options.GetArgument<bool>("synergy_det")),
++      cf_det_(options.GetArgument<bool>("cf_det")),
        //node_port_list_(options.GetRepeatedArgument<int>("node_port_list")),
        copy_read_data_(false),
        read_ahead_(options.GetArgument<bool>("read_ahead")),
@@ -731,7 +731,7 @@ index af16458..d30f184 100644
    const int node_id_;
    const bool resume_;
    const bool debug_;
-+  const bool synergy_det_;
++  const bool cf_det_;
    //vector<int> node_port_list_;
    std::mutex net_mutex_;
  
