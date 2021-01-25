@@ -9,10 +9,8 @@ CheckFreq is an automatic, fine-grained checkpointing framework that
   3. Maintains the training data invariant of using each item in the dataset exactly once per epoch by checkpointing data loader state using a light-weight resumable iterator
   4. Carefully pipelines checkpointing with computation to reduce the checkpoint cost by introducing two-phase checkpointing. 
   
-Our experiments on a variety of models show that CheckFreq can reduce the recovery time from hours to seconds while bounding the runtime overhead to less than 5%.
 
-
-[[pdf]](https://www.microsoft.com/en-us/research/publication/checkfreq-frequent-fine-grained-dnn-checkpointing/)  [[slides]]()
+[[pdf]](https://www.microsoft.com/en-us/research/publication/checkfreq-frequent-fine-grained-dnn-checkpointing/)      [[slides]]()
 
 
 ## Setup
