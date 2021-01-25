@@ -160,7 +160,7 @@ class HybridTrainPipe(Pipeline):
                 cf_det=False
                 self.input = ops.FileReader(file_root=data_dir, shard_id=shard, num_shards=args.world_size, shuffle_after_epoch=True)
             else:
-                self.input = ops.FileReader(file_root=data_dir, shard_id=shard, num_shards=args.world_size, shuffle_after_epoch=True, resume_index=resume_index, resume_epoch=resume_epoch, synergy_det=cf_det)
+                self.input = ops.FileReader(file_root=data_dir, shard_id=shard, num_shards=args.world_size, shuffle_after_epoch=True, resume_index=resume_index, resume_epoch=resume_epoch, cf_det=cf_det)
             
             print("CF deterministic shuffling is {}".format(cf_det))
 
